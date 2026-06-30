@@ -24,9 +24,9 @@ use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
 use crate::cpu_config::templates::StaticCpuTemplate;
 #[cfg(target_arch = "x86_64")]
-use crate::cpu_config::x86_64::cpuid::CpuidTrait;
-#[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
+#[cfg(target_arch = "x86_64")]
+use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 use crate::device_manager::{DevicePersistError, DevicesState};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
@@ -43,7 +43,7 @@ use crate::vstate::memory::{
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
-use crate::{EventManager, Vmm, vstate};
+use crate::{vstate, EventManager, Vmm};
 
 pub(crate) mod v1_10;
 pub(crate) mod v1_12;
@@ -425,6 +425,7 @@ pub fn restore_from_snapshot(
             track_dirty_pages,
             vm_resources.machine_config.huge_pages,
             params.mem_backend.use_memfd,
+            params.mem_backend.external_memfd_path.as_deref(),
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
@@ -521,6 +522,14 @@ pub enum GuestMemoryFromUffdError {
     WriteProtect(userfaultfd::Error),
     /// Failed to connect to UDS Unix stream: {0}
     Connect(#[from] std::io::Error),
+    /// Failed to receive external memfd: {0}
+    ReceiveExternalMemfd(vmm_sys_util::errno::Error),
+    /// External memfd socket did not pass a file descriptor
+    MissingExternalMemfd,
+    /// external_memfd_path cannot be used with use_memfd
+    ExternalMemfdWithUseMemfd,
+    /// external_memfd_path is not supported with huge pages
+    ExternalMemfdHugePages,
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
 }
@@ -531,9 +540,23 @@ fn guest_memory_from_uffd(
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
     use_memfd: bool,
+    external_memfd_path: Option<&Path>,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings, file) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages, use_memfd)?;
+    if use_memfd && external_memfd_path.is_some() {
+        return Err(GuestMemoryFromUffdError::ExternalMemfdWithUseMemfd);
+    }
+
+    if external_memfd_path.is_some() && huge_pages.is_hugetlbfs() {
+        return Err(GuestMemoryFromUffdError::ExternalMemfdHugePages);
+    }
+
+    let (guest_memory, backend_mappings, file) = match external_memfd_path {
+        Some(path) => {
+            let file = receive_external_memfd(path)?;
+            create_guest_memory_from_external_memfd(mem_state, track_dirty_pages, file)?
+        }
+        None => create_guest_memory(mem_state, track_dirty_pages, huge_pages, use_memfd)?,
+    };
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -552,11 +575,17 @@ fn guest_memory_from_uffd(
         .create()
         .map_err(GuestMemoryFromUffdError::Create)?;
 
+    // External memfd memory is file-backed by the supplied memfd. Pages that
+    // already exist in the memfd should be resolved by the kernel's normal
+    // file-backed fault path; UFFD is only needed for missing pages and dirty
+    // write-protection tracking.
+    let register_mode = RegisterMode::MISSING | RegisterMode::WRITE_PROTECT;
+
     for mem_region in guest_memory.iter() {
         uffd.register_with_mode(
             mem_region.as_ptr().cast(),
             mem_region.size() as _,
-            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+            register_mode,
         )
         .map_err(GuestMemoryFromUffdError::Register)?;
 
@@ -579,6 +608,16 @@ fn guest_memory_from_uffd(
     )?;
 
     Ok((guest_memory, Some(uffd)))
+}
+
+fn receive_external_memfd(memfd_uds_path: &Path) -> Result<File, GuestMemoryFromUffdError> {
+    let socket = UnixStream::connect(memfd_uds_path)?;
+    let mut buf = [0u8; 1];
+    let (_, file) = socket
+        .recv_with_fd(&mut buf[..])
+        .map_err(GuestMemoryFromUffdError::ReceiveExternalMemfd)?;
+
+    file.ok_or(GuestMemoryFromUffdError::MissingExternalMemfd)
 }
 
 type GuestMemoryComponents = (
@@ -605,6 +644,26 @@ fn create_guest_memory(
         (guest_memory, None)
     };
 
+    let backend_mappings = guest_memory_backend_mappings(&guest_memory, huge_pages);
+
+    Ok((guest_memory, backend_mappings, file))
+}
+
+fn create_guest_memory_from_external_memfd(
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    file: File,
+) -> Result<GuestMemoryComponents, GuestMemoryFromUffdError> {
+    let guest_memory = memory::snapshot_file(file, mem_state.regions(), track_dirty_pages)?;
+    let backend_mappings = guest_memory_backend_mappings(&guest_memory, HugePageConfig::None);
+
+    Ok((guest_memory, backend_mappings, None))
+}
+
+fn guest_memory_backend_mappings(
+    guest_memory: &[GuestRegionMmap],
+    huge_pages: HugePageConfig,
+) -> Vec<GuestRegionUffdMapping> {
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -619,7 +678,7 @@ fn create_guest_memory(
         offset += mem_region.size() as u64;
     }
 
-    Ok((guest_memory, backend_mappings, file))
+    backend_mappings
 }
 
 fn send_uffd_handshake(
@@ -686,14 +745,13 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-    use crate::Vmm;
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmclock_device;
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
     use crate::builder::tests::{
-        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
-        insert_block_devices, insert_net_device, insert_vsock_device,
+        default_kernel_cmdline, default_vmm, insert_balloon_device, insert_block_devices,
+        insert_net_device, insert_vsock_device, CustomBlockConfig,
     };
     #[cfg(target_arch = "aarch64")]
     use crate::construct_kvm_mpidrs;
@@ -704,6 +762,7 @@ mod tests {
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::memory::create_memfd;
     use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
+    use crate::Vmm;
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");
@@ -859,6 +918,53 @@ mod tests {
             file.is_none(),
             "expected no backing file when use_memfd=false"
         );
+    }
+
+    #[test]
+    fn test_receive_external_memfd() {
+        let uds_path = TempFile::new().unwrap();
+        let uds_path = uds_path.as_path().to_path_buf();
+        std::fs::remove_file(&uds_path).unwrap();
+
+        let listener = UnixListener::bind(&uds_path).expect("Cannot bind to socket path");
+        let mock_memfd = create_memfd(4096, None).unwrap().into_file();
+
+        let sender = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("Cannot accept UDS connection");
+            let msg: &[u8] = b"x";
+            stream
+                .send_with_fds(&[msg], &[mock_memfd.as_raw_fd()])
+                .expect("Cannot send external memfd fd");
+        });
+
+        let received = receive_external_memfd(&uds_path).expect("Cannot receive external memfd");
+        sender.join().unwrap();
+
+        assert_eq!(received.metadata().unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn test_receive_external_memfd_requires_fd() {
+        let uds_path = TempFile::new().unwrap();
+        let uds_path = uds_path.as_path().to_path_buf();
+        std::fs::remove_file(&uds_path).unwrap();
+
+        let listener = UnixListener::bind(&uds_path).expect("Cannot bind to socket path");
+        let sender = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("Cannot accept UDS connection");
+            let msg: &[u8] = b"x";
+            stream
+                .send_with_fds(&[msg], &[])
+                .expect("Cannot send empty fd message");
+        });
+
+        let err = receive_external_memfd(&uds_path).unwrap_err();
+        sender.join().unwrap();
+
+        assert!(matches!(
+            err,
+            GuestMemoryFromUffdError::MissingExternalMemfd
+        ));
     }
 
     #[test]

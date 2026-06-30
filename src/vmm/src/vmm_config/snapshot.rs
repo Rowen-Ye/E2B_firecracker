@@ -118,6 +118,10 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// Path to a UDS that provides an external memfd backing file for UFFD memory restore.
+    /// Only valid when `backend_type` is `Uffd` and mutually exclusive with `use_memfd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_memfd_path: Option<PathBuf>,
     /// When true, guest memory is backed by a memfd and its file descriptor is sent to the UFFD
     /// handler over the UFFD socket. Only valid when `backend_type` is `Uffd`.
     #[serde(default)]

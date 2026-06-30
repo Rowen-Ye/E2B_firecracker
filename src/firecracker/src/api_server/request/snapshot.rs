@@ -97,6 +97,18 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                     "use_memfd is only valid when backend_type is Uffd",
                 )));
             }
+            if backend_cfg.external_memfd_path.is_some()
+                && backend_cfg.backend_type != MemBackendType::Uffd
+            {
+                return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                    "external_memfd_path is only valid when backend_type is Uffd",
+                )));
+            }
+            if backend_cfg.use_memfd && backend_cfg.external_memfd_path.is_some() {
+                return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                    "external_memfd_path cannot be used with use_memfd",
+                )));
+            }
             backend_cfg
         }
         None => {
@@ -105,6 +117,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 // either `mem_file_path` or `mem_backend` field is always specified.
                 backend_path: snapshot_config.mem_file_path.unwrap(),
                 backend_type: MemBackendType::File,
+                external_memfd_path: None,
                 use_memfd: false,
             }
         }
@@ -192,6 +205,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                external_memfd_path: None,
                 use_memfd: false,
             },
             track_dirty_pages: false,
@@ -224,6 +238,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                external_memfd_path: None,
                 use_memfd: false,
             },
             track_dirty_pages: true,
@@ -256,6 +271,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                external_memfd_path: None,
                 use_memfd: false,
             },
             track_dirty_pages: false,
@@ -294,6 +310,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                external_memfd_path: None,
                 use_memfd: false,
             },
             track_dirty_pages: false,
@@ -326,6 +343,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                external_memfd_path: None,
                 use_memfd: false,
             },
             track_dirty_pages: false,
@@ -429,6 +447,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                external_memfd_path: None,
                 use_memfd: true,
             },
             track_dirty_pages: false,
@@ -443,6 +462,38 @@ mod tests {
             VmmAction::LoadSnapshot(expected_config)
         );
 
+        // external_memfd_path with Uffd backend must be accepted and propagated.
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "Uffd",
+                "external_memfd_path": "memfd.sock"
+            }
+        }"#;
+        let expected_config = LoadSnapshotParams {
+            snapshot_path: PathBuf::from("foo"),
+            mem_backend: MemBackendConfig {
+                backend_path: PathBuf::from("bar"),
+                backend_type: MemBackendType::Uffd,
+                use_memfd: false,
+                external_memfd_path: Some(PathBuf::from("memfd.sock")),
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            clock_realtime: false,
+        };
+        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        assert!(parsed_request
+            .parsing_info()
+            .take_deprecation_message()
+            .is_none());
+        assert_eq!(
+            vmm_action_from_request(parsed_request),
+            VmmAction::LoadSnapshot(expected_config)
+        );
+
         // use_memfd=true with File backend must be rejected.
         let body = r#"{
             "snapshot_path": "foo",
@@ -450,6 +501,29 @@ mod tests {
                 "backend_path": "bar",
                 "backend_type": "File",
                 "use_memfd": true
+            }
+        }"#;
+        parse_put_snapshot(&Body::new(body), Some("load")).unwrap_err();
+
+        // external_memfd_path with File backend must be rejected.
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "File",
+                "external_memfd_path": "memfd.sock"
+            }
+        }"#;
+        parse_put_snapshot(&Body::new(body), Some("load")).unwrap_err();
+
+        // external_memfd_path and use_memfd are mutually exclusive.
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "Uffd",
+                "use_memfd": true,
+                "external_memfd_path": "memfd.sock"
             }
         }"#;
         parse_put_snapshot(&Body::new(body), Some("load")).unwrap_err();

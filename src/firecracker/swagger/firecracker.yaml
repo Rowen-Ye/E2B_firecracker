@@ -1542,6 +1542,13 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults
+      external_memfd_path:
+        type: string
+        description:
+          Path to a UDS where Firecracker receives an external memfd file descriptor
+          used as the private file-backed guest memory source for UFFD restore.
+          Only valid when 'backend_type' is 'Uffd' and mutually exclusive with
+          'use_memfd'.
       use_memfd:
         type: boolean
         description:
